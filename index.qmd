@@ -314,7 +314,7 @@ More sophisticated initialization strategies exist (like using K-means cluster c
 
 ```{julia}
 #| output: false
-function initialize_hmm(n_states, n_dims; seed=42)
+function initialize_hmm(n_states, n_dims; seed=102)
     Random.seed!(seed)
 
     # Random initial state distribution (normalized)
@@ -332,7 +332,7 @@ function initialize_hmm(n_states, n_dims; seed=42)
     return HMM(init_probs, trans_probs, emissions)
 end
 
-n_states = 6  # Following Doss-Gollin et al. (2018)
+n_states = 6  # Following Doss-Gollin et al. (2018)  
 n_pcs = size(pca_data.pc_scores, 2)
 
 hmm_init = initialize_hmm(n_states, n_pcs)
@@ -450,6 +450,8 @@ end
 ### Emission Distributions vs Composites
 
 This is a key conceptual point: The emission distributions are multivariate normals in PC space, while composites are spatial averages.
+
+note: emission distributions are about the model's internal representation in PC space, with a center and a spread of variance of PC values, while composites are about the average real-world pattern for each state.
 
 First, examine the emission distribution parameters:
 
@@ -614,7 +616,7 @@ While related, these are different representations:
 - Emission distributions tell us the typical PC values for each state
 - Composites show the typical spatial pattern in the original data space
 - Days assigned to a state have PC values drawn from the emission distribution
-- The composite is the average of projecting those PC values back to physical space
+- !!The composite is the average of projecting those PC values back to physical space!!
 :::
 
 ## Analysis Questions
@@ -627,10 +629,102 @@ K-means cannot do this - it fundamentally ignores temporal order.
 
 1. Fit HMMs with 3, 4, 5, and 7 states. How does the transition matrix structure change? Is temporal persistence stronger with fewer or more states?
 
+With fewer states, the transition matrix is smaller and the temporal persistence is much stronger! With more states, there are higher probablilities that the state will change from state to state. 
+
 1. Run the same HMM configuration (6 states, 4 PCs) with 3 different random seeds. How different are the resulting state patterns and transition matrices?
+
+The resulting state patterns are quite different in that different weather states are chosen with different seeds. The tranisition matrices also differ in probabilitiy estimates but not as much in terms of trends.
 
 1. Compare results to the $K$-means clustering from lab 8. Where do they agree and disagree? Why?
 
+The composites and K-means clustering is similair in their most common weather types are cyclonic, but they differ in that the weather types using HMMs indicate weaker anomoly types. This is because HMMs sometimes assign days to a state for the sake of temporal consistency, even if those days are not the closest in PC space, resulting in more mixed or averaged composites. In contrast, K-means always assigns each day to the nearest cluster center, producing sharper and more extreme composites.
+Additionally, HMMs capture temporal persistence and transitions between states, while K-means treats each day independently.
+
 1. Write code to generate synthetic weather sequences from your fitted HMM using the `rand()` function. Create a 120-day sequence with corresponding PC values and spatial maps for a few days. Compare state frequencies, transition frequencies, and PC distributions between real and synthetic data.
 
+```{julia}
+# Generate a synthetic 120-day sequence
+n_days = 120
+synthetic_states, synthetic_pcs = rand(hmm_trained, n_days)
+
+#Reconstruct spatial maps for the first 3 synthetic days
+reconstructed_maps = []
+for i in 1:3
+    ψ_reconstructed = MultivariateStats.reconstruct(pca_data.pca_model, synthetic_pcs[i])
+    push!(reconstructed_maps, reshape(ψ_reconstructed, size(pca_data.ψ_climatology)))
+end
+
+# Compare state frequencies
+using StatsBase
+
+# Real state frequencies (from all_states)
+real_state_counts = countmap(all_states)
+synthetic_state_counts = countmap(synthetic_states)
+
+println("Real state frequencies: ", real_state_counts)
+println("Synthetic state frequencies: ", synthetic_state_counts)
+
+# Compare transition frequencies
+function transition_matrix_from_sequence(states, n_states)
+    mat = zeros(n_states, n_states)
+    for i in 1:(length(states)-1)
+        mat[states[i], states[i+1]] += 1
+    end
+    # Normalize rows to sum to 1
+    row_sums = sum(mat, dims=2)
+    row_sums[row_sums .== 0] .= 1 # avoid division by zero
+    mat ./= row_sums
+    return mat
+end
+
+real_trans = transition_matrix_from_sequence(all_states, n_states)
+synthetic_trans = transition_matrix_from_sequence(synthetic_states, n_states)
+
+println("Real transition matrix:\n", real_trans)
+println("Synthetic transition matrix:\n", synthetic_trans)
+
+# 5. Compare PC distributions (mean and std for each PC)
+real_pcs = pca_data.pc_scores
+synthetic_pcs_mat = hcat(synthetic_pcs...)' # n_days × n_pcs
+
+println("Real PC means: ", mean(real_pcs, dims=1))
+println("Synthetic PC means: ", mean(synthetic_pcs_mat, dims=1))
+println("Real PC stds: ", std(real_pcs, dims=1))
+println("Synthetic PC stds: ", std(synthetic_pcs_mat, dims=1))
+
+# Plot the reconstructed spatial maps for first 3 synthetic days
+let
+    fig = Figure(size=(1200, 400))
+    
+    # Determine color range based on all reconstructed maps
+    all_values = vcat([vec(map) for map in reconstructed_maps]...)
+    crange = maximum(abs.(extrema(all_values)))
+    crange = (-crange, crange)
+    
+    for i in 1:3
+        ax = create_geoaxis(fig, (1, i); 
+            title="Synthetic Day $i (State $(synthetic_states[i]))")
+        
+        heatmap!(ax, pca_data.coordinates.lon, pca_data.coordinates.lat,
+            reconstructed_maps[i]; colormap=cmap_diverging, colorrange=crange)
+        add_boundaries!(ax)
+    end
+    
+    Colorbar(fig[1, 4], limits=crange, colormap=cmap_diverging,
+        label=L"$\psi$ Anomaly ($10^6$ m$^2$/s)")
+    
+    fig
+end
+```
+
+The synthetic state frequencies are much for sparse and have very uneven distribution compared to the real data. 120 days is probably not long enough to capture long-term state probablilites. 
+For the transition matrix, there are lot of zero and very high values, indication that they are too extreme and could indicate overfitting.
+The PC distribution means were very different for the synthetic data in that most of the real means were close to zero but synthetic data had really high values, which means that it is probably biased towards certain weather patterns.
+
 1. Describe how you would extend this to predict rainfall. What emission distribution would you use? How would you validate whether HMM states relate to rainfall patterns? What are the fundamental limitations for extreme rainfall?
+
+To predict rainfall, I would use HMM weather states that drive local rainfall patterns through a Gamma distribution (to handle dry days and right-skewed precipitation). I would validate by checking if different HMM states show distinct rainfall characteristics, testing seasonal patterns, and using cross-validation with skill metrics like RMSE. 
+
+The main limitations for extreme rainfall are that large-scale circulation patterns (what HMMs capture) don't fully determine the regional processes that cause extreme precipitation, rare events are poorly sampled in training data, and the models miss important small-scale meteorological processes like topographic effects and mesoscale convection.
+
+
